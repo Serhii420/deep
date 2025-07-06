@@ -1,3 +1,4 @@
 flask
 requests
 waitress>=2.1
+websockets
