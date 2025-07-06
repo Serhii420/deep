@@ -1,73 +1,82 @@
 import asyncio
 import json
+import requests
 import websockets
-import logging
 from flask import Flask, request
-import telegram
-import threading
+from waitress import serve
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# Налаштування
-TOKEN = "7640189770:AAH01Kw3SGSXVZL6bBVStw4MWpzrCpPchpo"
-CHAT_ID = "402100936"
-URL_PATH = f"/{TOKEN}"
+# === CONFIG ===
+BOT_TOKEN = "7640189770:AAH01Kw3SGSXVZL6bBVStw4MWpzrCpPchpo"
+CHAT_ID = 402100936
+WS_URL = "wss://fstream.binance.com/ws/ethusdt@depth20@100ms"
+IMBALANCE_THRESHOLD = 1.01
+
+# === FLASK ===
 app = Flask(__name__)
-bot = telegram.Bot(token=TOKEN)
 
-# Флаг для запуску WebSocket
-ws_started = False
+# === TELEGRAM HANDLER ===
+async def imbalance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📡 Очікуємо сигнал з біржі...")
 
-# Обробка webhook
-@app.route(URL_PATH, methods=["POST"])
-def webhook():
-    data = request.get_json()
-    if data and "message" in data and "text" in data["message"]:
-        text = data["message"]["text"]
-        if text == "/imbalance":
-            bot.send_message(chat_id=CHAT_ID, text="DeepLocal: очікуємо сигнал з біржі...")
-    return "ok"
-
-# Аналіз orderbook
-async def analyze_orderbook(message):
+# === ANALYSIS ===
+def analyze_orderbook(data):
     try:
-        data = json.loads(message)
-        if "b" in data and "a" in data:
-            bids = data["b"]
-            asks = data["a"]
-            if not bids or not asks:
-                return
-            top_bid = float(bids[0][1])
-            top_ask = float(asks[0][1])
-            imbalance = round((top_bid - top_ask) / (top_bid + top_ask) * 100, 4)
+        bids = data["bids"]
+        asks = data["asks"]
+        bid_vol = sum(float(b[1]) for b in bids[:5])
+        ask_vol = sum(float(a[1]) for a in asks[:5])
 
-            print(f"[WS] Imbalance: {imbalance}%")  # для відлагодження
-
-            if abs(imbalance) > 1:  # знижено до 1%
-                side = "⬆ BUY" if imbalance > 0 else "⬇ SELL"
-                msg = f"📊 DeepLocal Signal:
-{side} imbalance: {imbalance}%"
-                bot.send_message(chat_id=CHAT_ID, text=msg)
+        if bid_vol > ask_vol * IMBALANCE_THRESHOLD:
+            return "BUY"
+        elif ask_vol > bid_vol * IMBALANCE_THRESHOLD:
+            return "SELL"
+        else:
+            return None
     except Exception as e:
-        print("Error in analyze_orderbook:", e)
+        print("Error analyzing:", e)
+        return None
 
-# WebSocket-підключення
-async def start_websocket():
-    url = "wss://stream.binance.com:9443/ws/ethusdt@depth20@100ms"
-    async with websockets.connect(url) as ws:
+def send_telegram_message(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    requests.post(url, json={"chat_id": CHAT_ID, "text": text})
+
+# === WEBSOCKET WATCHER ===
+async def watch_orderbook():
+    async with websockets.connect(WS_URL) as ws:
         while True:
-            message = await ws.recv()
-            await analyze_orderbook(message)
+            try:
+                msg = await ws.recv()
+                data = json.loads(msg)
+                signal = analyze_orderbook(data)
+                if signal:
+                    message = (
+                        "📊 DeepLocal Signal:\n"
+                        f"Market: ETH/USDT\n"
+                        f"Signal: {signal} ⚡️"
+                    )
+                    send_telegram_message(message)
+                    await asyncio.sleep(10)
+            except Exception as e:
+                print("WebSocket error:", e)
+                await asyncio.sleep(5)
 
-# Запуск WebSocket у потоці
-def run_ws():
-    asyncio.new_event_loop().run_until_complete(start_websocket())
+# === TELEGRAM BOT START ===
+async def start_bot():
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("imbalance", imbalance_command))
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    asyncio.create_task(watch_orderbook())
 
-def start_ws_thread():
-    global ws_started
-    if not ws_started:
-        threading.Thread(target=run_ws, daemon=True).start()
-        ws_started = True
+# === START ALL ===
+@app.route("/", methods=["GET"])
+def home():
+    return "Bot is running"
 
-# Запуск Flask і WebSocket
 if __name__ == "__main__":
-    start_ws_thread()
-    app.run(host="0.0.0.0", port=8080)
+    loop = asyncio.get_event_loop()
+    loop.create_task(start_bot())
+    serve(app, host="0.0.0.0", port=8080)
